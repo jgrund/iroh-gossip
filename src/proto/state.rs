@@ -5,7 +5,7 @@ use std::collections::{hash_map, HashMap, HashSet};
 use n0_future::time::{Duration, Instant};
 use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
-use tracing::trace;
+use tracing::{debug, trace};
 
 use crate::{
     metrics::Metrics,
@@ -272,6 +272,18 @@ impl<PI: PeerIdentity, R: Rng + SeedableRng> State<PI, R> {
                     for event in out {
                         handle_out_event(topic, event, &mut self.peer_topics, &mut self.outbox);
                     }
+                } else if let topic::InEvent::RecvMessage(from, _) = &event {
+                    let shares_topic = self
+                        .peer_topics
+                        .get(from)
+                        .is_some_and(|topics| topics.iter().any(|t| self.states.contains_key(t)));
+                    if shares_topic {
+                        debug!(peer = ?from, topic = %topic.fmt_short(), "drop message for unsubscribed topic");
+                    } else {
+                        debug!(peer = ?from, topic = %topic.fmt_short(), "disconnect peer that sent for unsubscribed topic");
+                        self.peer_topics.remove(from);
+                        self.outbox.push(OutEvent::DisconnectPeer(*from));
+                    }
                 }
 
                 if quit {
@@ -417,6 +429,96 @@ mod tests {
         assert!(
             !state.peer_topics.contains_key(&peer),
             "PeerDisconnected must prune the peer from peer_topics"
+        );
+    }
+
+    fn join_message(topic: TopicId) -> Message<u32> {
+        Message {
+            topic,
+            message: topic::Message::Swarm(crate::proto::hyparview::Message::Join(None)),
+        }
+    }
+
+    fn new_state() -> State<u32, StdRng> {
+        State::new(
+            0,
+            PeerData::new(Vec::<u8>::new()),
+            Config::default(),
+            StdRng::seed_from_u64(1),
+        )
+    }
+
+    /// A message for a topic we did not subscribe must refuse the connection:
+    /// the sender's join is fire-and-forget, so a silent drop leaves it waiting
+    /// forever. The peer shares no subscribed topic here, so the connection is
+    /// closed and no topic state is created.
+    #[test]
+    fn unknown_topic_message_from_topicless_peer_disconnects() {
+        let mut state = new_state();
+        let topic_b = TopicId::from_bytes([2u8; 32]);
+        let peer = 7u32;
+
+        let out: Vec<_> = state
+            .handle(
+                InEvent::RecvMessage(peer, join_message(topic_b)),
+                Instant::now(),
+                None,
+            )
+            .collect();
+
+        assert!(
+            out.iter()
+                .any(|event| matches!(event, OutEvent::DisconnectPeer(p) if *p == peer)),
+            "unknown topic message must disconnect the peer, got {out:?}"
+        );
+        assert!(
+            state.state(&topic_b).is_none(),
+            "unknown topic must not create topic state"
+        );
+    }
+
+    /// A peer that shares a subscribed topic with us must keep its connection
+    /// when it sends for an unknown topic: closing it would kill the healthy
+    /// topics. The message is dropped instead, and no topic state is created.
+    #[test]
+    fn unknown_topic_message_from_peer_with_shared_topic_is_dropped() {
+        let mut state = new_state();
+        let topic_a = TopicId::from_bytes([1u8; 32]);
+        let topic_b = TopicId::from_bytes([2u8; 32]);
+        let peer = 7u32;
+
+        state
+            .handle(
+                InEvent::Command(topic_a, Command::Join(vec![])),
+                Instant::now(),
+                None,
+            )
+            .for_each(drop);
+        state
+            .handle(
+                InEvent::RecvMessage(peer, join_message(topic_a)),
+                Instant::now(),
+                None,
+            )
+            .for_each(drop);
+        assert!(state.has_active_peers(&topic_a));
+
+        let out: Vec<_> = state
+            .handle(
+                InEvent::RecvMessage(peer, join_message(topic_b)),
+                Instant::now(),
+                None,
+            )
+            .collect();
+
+        assert!(
+            out.is_empty(),
+            "message must be dropped silently, got {out:?}"
+        );
+        assert!(state.has_active_peers(&topic_a));
+        assert!(
+            state.state(&topic_b).is_none(),
+            "unknown topic must not create topic state"
         );
     }
 }
