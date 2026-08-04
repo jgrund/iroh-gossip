@@ -15,6 +15,7 @@ use n0_error::{e, stack_error};
 use n0_future::{Stream, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 
+pub use crate::proto::NeighborDownReason;
 use crate::proto::{DeliveryScope, TopicId};
 
 /// Default channel capacity for topic subscription channels (one per topic)
@@ -342,6 +343,12 @@ pub enum Event {
     Received(Message),
     /// We missed some messages because our [`GossipReceiver`] was not progressing fast enough.
     Lagged,
+    /// We dropped a direct neighbor in the swarm membership layer for this topic; carries the
+    /// removal reason.
+    ///
+    /// Emitted directly after the matching [`Event::NeighborDown`]; ignore it if you do not need
+    /// the reason.
+    NeighborDownWithReason(EndpointId, NeighborDownReason),
 }
 
 impl From<crate::proto::Event<EndpointId>> for Event {
@@ -349,6 +356,9 @@ impl From<crate::proto::Event<EndpointId>> for Event {
         match event {
             crate::proto::Event::NeighborUp(endpoint_id) => Self::NeighborUp(endpoint_id),
             crate::proto::Event::NeighborDown(endpoint_id) => Self::NeighborDown(endpoint_id),
+            crate::proto::Event::NeighborDownWithReason(endpoint_id, reason) => {
+                Self::NeighborDownWithReason(endpoint_id, reason)
+            }
             crate::proto::Event::Received(message) => Self::Received(Message {
                 content: message.content,
                 scope: message.scope,
@@ -410,7 +420,27 @@ impl JoinOptions {
 
 #[cfg(test)]
 mod tests {
-    use crate::api::GossipTopic;
+    use crate::api::{Event, GossipTopic, NeighborDownReason};
+
+    /// Partition-class and eviction-class removals must stay distinguishable at the API surface.
+    #[test]
+    fn neighbor_down_reason_reaches_api_event() {
+        let id = iroh_base::SecretKey::from_bytes(&[1u8; 32]).public();
+        assert_eq!(
+            Event::from(crate::proto::Event::NeighborDownWithReason(
+                id,
+                NeighborDownReason::ConnectionLost
+            )),
+            Event::NeighborDownWithReason(id, NeighborDownReason::ConnectionLost)
+        );
+        assert_eq!(
+            Event::from(crate::proto::Event::NeighborDownWithReason(
+                id,
+                NeighborDownReason::Evicted
+            )),
+            Event::NeighborDownWithReason(id, NeighborDownReason::Evicted)
+        );
+    }
 
     #[cfg(all(feature = "rpc", feature = "net"))]
     #[tokio::test]

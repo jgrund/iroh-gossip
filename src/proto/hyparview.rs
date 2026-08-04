@@ -50,11 +50,14 @@ pub enum OutEvent<PI> {
 
 /// Event emitted by the [`State`] to the application.
 #[derive(Clone, Debug)]
+#[allow(clippy::enum_variant_names)]
 pub enum Event<PI> {
     /// A peer was added to our set of active connections.
     NeighborUp(PI),
     /// A peer was removed from our set of active connections.
     NeighborDown(PI),
+    /// A peer was removed from our set of active connections; carries why.
+    NeighborDownWithReason(PI, NeighborDownReason),
 }
 
 /// Kinds of timers HyParView needs to schedule.
@@ -651,6 +654,10 @@ where
     ) -> Option<PI> {
         if let Some(peer) = self.active_view.remove_index(peer_index) {
             io.push(OutEvent::EmitEvent(Event::NeighborDown(peer)));
+            io.push(OutEvent::EmitEvent(Event::NeighborDownWithReason(
+                peer,
+                reason.into(),
+            )));
 
             match reason {
                 // send a disconnect message, then close connection.
@@ -763,7 +770,7 @@ where
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 enum RemovalReason {
     /// A peer is removed because the connection was closed ungracefully.
     ConnectionClosed,
@@ -773,6 +780,27 @@ enum RemovalReason {
     Random,
 }
 
+/// Why a neighbor was removed from the active view.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+pub enum NeighborDownReason {
+    /// The peer was evicted at random to free an active-view slot; it stays in the passive view on both sides.
+    Evicted,
+    /// The peer sent a graceful disconnect; membership knowledge is preserved.
+    PeerDisconnected,
+    /// The transport connection died; knowledge of the peer may be lost.
+    ConnectionLost,
+}
+
+impl From<RemovalReason> for NeighborDownReason {
+    fn from(reason: RemovalReason) -> Self {
+        match reason {
+            RemovalReason::Random => Self::Evicted,
+            RemovalReason::DisconnectReceived { .. } => Self::PeerDisconnected,
+            RemovalReason::ConnectionClosed => Self::ConnectionLost,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -780,7 +808,7 @@ mod tests {
     use rand::{rngs::StdRng, SeedableRng};
 
     use super::*;
-    use crate::proto::topic::OutEvent as TopicOut;
+    use crate::proto::topic::{Event as TopicEvent, OutEvent as TopicOut};
 
     fn state() -> State<u32, StdRng> {
         State::new(0u32, None, Config::default(), StdRng::seed_from_u64(1))
@@ -847,6 +875,39 @@ mod tests {
         assert!(
             !state.peer_data.contains_key(&peer),
             "active-view discard (not kept) must prune peer_data"
+        );
+    }
+
+    /// A dead transport must surface as `ConnectionLost`, next to the legacy `NeighborDown`.
+    #[test]
+    fn connection_closed_emits_neighbor_down_with_connection_lost() {
+        let mut state = state();
+        let mut io = VecDeque::<TopicOut<u32>>::new();
+        let peer = 40;
+        state.active_view.insert(peer);
+        state.handle_connection_closed(peer, &mut io);
+        assert!(io.contains(&TopicOut::EmitEvent(TopicEvent::NeighborDown(peer))));
+        assert!(
+            io.contains(&TopicOut::EmitEvent(TopicEvent::NeighborDownWithReason(
+                peer,
+                NeighborDownReason::ConnectionLost
+            )))
+        );
+    }
+
+    /// A random eviction must surface as `Evicted`, not as a lost connection.
+    #[test]
+    fn random_eviction_emits_neighbor_down_with_evicted() {
+        let mut state = state();
+        let mut io = VecDeque::<TopicOut<u32>>::new();
+        let peer = 50;
+        state.active_view.insert(peer);
+        state.free_random_slot_in_active_view(&mut io);
+        assert!(
+            io.contains(&TopicOut::EmitEvent(TopicEvent::NeighborDownWithReason(
+                peer,
+                NeighborDownReason::Evicted
+            )))
         );
     }
 }
