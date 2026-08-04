@@ -1113,7 +1113,7 @@ pub(crate) mod tests {
     use tracing::{info, instrument};
 
     use super::*;
-    use crate::api::{ApiError, GossipReceiver, GossipSender};
+    use crate::api::{ApiError, GossipReceiver, GossipSender, NeighborDownReason};
 
     struct ManualActorLoop {
         actor: Actor,
@@ -1914,6 +1914,16 @@ pub(crate) mod tests {
             .await
             .std_context("wait neighbor down")??;
         assert_eq!(ev, Some(Event::NeighborDown(endpoint_id2)));
+        let ev = timeout(conn_timeout, sub.try_next())
+            .await
+            .std_context("wait neighbor down reason")??;
+        assert_eq!(
+            ev,
+            Some(Event::NeighborDownWithReason(
+                endpoint_id2,
+                NeighborDownReason::PeerDisconnected
+            ))
+        );
         tracing::info!("endpoint 2 left");
 
         // signal endpoint_2 to subscribe again

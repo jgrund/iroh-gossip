@@ -59,7 +59,7 @@ pub mod util;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod sim;
 
-pub use hyparview::Config as HyparviewConfig;
+pub use hyparview::{Config as HyparviewConfig, NeighborDownReason};
 pub use plumtree::{Config as PlumtreeConfig, DeliveryScope, Scope};
 pub use state::{InEvent, Message, OutEvent, State, Timer, TopicId};
 pub use topic::{Command, Config, Event, IO};
@@ -133,7 +133,7 @@ mod test {
     use n0_tracing_test::traced_test;
     use rand::{rngs::ChaCha12Rng, SeedableRng};
 
-    use super::{Command, Config, Event};
+    use super::{Command, Config, Event, NeighborDownReason};
     use crate::proto::{
         sim::{LatencyConfig, Network, NetworkConfig},
         Scope, TopicId,
@@ -193,13 +193,33 @@ mod test {
             (3, t, Event::NeighborUp(0)),
             (0, t, Event::NeighborUp(3)),
             (0, t, Event::NeighborDown(1)),
+            (
+                0,
+                t,
+                Event::NeighborDownWithReason(1, NeighborDownReason::Evicted),
+            ),
             (1, t, Event::NeighborDown(0)),
+            (
+                1,
+                t,
+                Event::NeighborDownWithReason(0, NeighborDownReason::PeerDisconnected),
+            ),
         ]);
         let expected2 = sort(vec![
             (3, t, Event::NeighborUp(0)),
             (0, t, Event::NeighborUp(3)),
             (0, t, Event::NeighborDown(2)),
+            (
+                0,
+                t,
+                Event::NeighborDownWithReason(2, NeighborDownReason::Evicted),
+            ),
             (2, t, Event::NeighborDown(0)),
+            (
+                2,
+                t,
+                Event::NeighborDownWithReason(0, NeighborDownReason::PeerDisconnected),
+            ),
         ]);
         assert!((actual == expected1) || (actual == expected2));
 

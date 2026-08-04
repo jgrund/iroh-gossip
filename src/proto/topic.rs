@@ -9,7 +9,7 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    hyparview::{self, InEvent as SwarmIn},
+    hyparview::{self, InEvent as SwarmIn, NeighborDownReason},
     plumtree::{self, GossipEvent, InEvent as GossipIn, Scope},
     state::MessageKind,
     PeerData, PeerIdentity, DEFAULT_MAX_MESSAGE_SIZE,
@@ -123,6 +123,10 @@ pub enum Event<PI> {
     NeighborDown(PI),
     /// A gossip message was received for this topic
     Received(GossipEvent<PI>),
+    /// We dropped a direct neighbor for this topic; carries the removal reason.
+    ///
+    /// Emitted directly after the matching [`Event::NeighborDown`].
+    NeighborDownWithReason(PI, NeighborDownReason),
 }
 
 impl<PI> From<hyparview::Event<PI>> for Event<PI> {
@@ -130,6 +134,9 @@ impl<PI> From<hyparview::Event<PI>> for Event<PI> {
         match value {
             hyparview::Event::NeighborUp(peer) => Self::NeighborUp(peer),
             hyparview::Event::NeighborDown(peer) => Self::NeighborDown(peer),
+            hyparview::Event::NeighborDownWithReason(peer, reason) => {
+                Self::NeighborDownWithReason(peer, reason)
+            }
         }
     }
 }
