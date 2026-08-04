@@ -435,14 +435,19 @@ impl Actor {
                     Some(Err(err)) => {
                         warn!(peer = %peer_id.fmt_short(), "dial failed: {err}");
                         self.metrics.actor_tick_dialer_failure.inc();
-                        let peer_state = self.peers.get(&peer_id);
-                        let is_active = matches!(peer_state, Some(PeerState::Active { .. }));
+                        let is_active = matches!(self.peers.get(&peer_id), Some(PeerState::Active { .. }));
                         if !is_active {
+                            if let Some(PeerState::Pending { queue }) = self.peers.remove(&peer_id) {
+                                let topics: BTreeSet<TopicId> = queue.iter().map(|message| message.topic).collect();
+                                for topic_id in topics {
+                                    if let Some(state) = self.topics.get_mut(&topic_id) {
+                                        state.event_sender.send(Event::JoinFailed(peer_id)).ok();
+                                    }
+                                }
+                            }
                             self.handle_in_event(InEvent::PeerDisconnected(peer_id), Instant::now())
                                 .await;
                         }
-                        // Remove from active peers tracking map to reclaim connection resources on dial failure
-                        self.peers.remove(&peer_id);
                     }
                     None => {
                         warn!(peer = %peer_id.fmt_short(), "dial disconnected");
@@ -725,7 +730,7 @@ impl Actor {
                         }
                         _ => {}
                     }
-                    event_sender.send(event).ok();
+                    event_sender.send(event.into()).ok();
                     if !state.still_needed() {
                         self.quit_queue.push_back(topic_id);
                     }
@@ -816,7 +821,7 @@ impl Default for PeerState {
 #[derive(Debug)]
 struct TopicState {
     neighbors: BTreeSet<EndpointId>,
-    event_sender: broadcast::Sender<ProtoEvent>,
+    event_sender: broadcast::Sender<Event>,
     /// Keys identifying command receivers in [`Actor::command_rx`].
     ///
     /// This represents the receiver side of gossip's publish public API.
@@ -941,7 +946,7 @@ fn decode_peer_data(peer_data: &PeerData) -> Result<AddrInfo, postcard::Error> {
 
 async fn topic_subscriber_loop(
     sender: irpc::channel::mpsc::Sender<Event>,
-    mut topic_events: broadcast::Receiver<ProtoEvent>,
+    mut topic_events: broadcast::Receiver<Event>,
 ) {
     loop {
         tokio::select! {
@@ -950,7 +955,7 @@ async fn topic_subscriber_loop(
                let event = match msg {
                    Err(broadcast::error::RecvError::Closed) => break,
                    Err(broadcast::error::RecvError::Lagged(_)) => Event::Lagged,
-                   Ok(event) => event.into(),
+                   Ok(event) => event,
                };
                if sender.send(event).await.is_err() {
                    break;
@@ -1982,6 +1987,30 @@ pub(crate) mod tests {
 
         tokio::try_join!(r1.shutdown(), r2.shutdown(), r3.shutdown())
             .std_context("shutdown routers")?;
+        Ok(())
+    }
+
+    /// A failed dial for a queued join must surface as [`Event::JoinFailed`] to the subscribers of
+    /// the requesting topic instead of being swallowed by the actor.
+    #[tokio::test]
+    #[traced_test]
+    async fn join_peers_dial_failure_emits_join_failed() -> n0_error::Result<()> {
+        let topic_id = TopicId::from([7u8; 32]);
+        let target = SecretKey::from_bytes(&[42u8; 32]).public();
+
+        let ep = Endpoint::bind(presets::Minimal).await?;
+        let gossip = Gossip::builder().spawn(ep.clone());
+        let topic = gossip.subscribe(topic_id, vec![]).await?;
+        let (sender, mut receiver) = topic.split();
+
+        sender.join_peers(vec![target]).await?;
+
+        let event = timeout(Duration::from_secs(30), receiver.next())
+            .await
+            .std_context("wait for join failure")?;
+        assert!(matches!(event, Some(Ok(Event::JoinFailed(p))) if p == target));
+
+        ep.close().await;
         Ok(())
     }
 

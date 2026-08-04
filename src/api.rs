@@ -190,6 +190,11 @@ impl GossipSender {
     }
 
     /// Joins a set of peers.
+    ///
+    /// `Ok` means the join command was queued, not that the peers were joined:
+    /// joining proceeds asynchronously in the gossip actor. A successful join
+    /// surfaces as [`Event::NeighborUp`] on the topic's event stream; a failed
+    /// dial surfaces as [`Event::JoinFailed`].
     pub async fn join_peers(&self, peers: Vec<EndpointId>) -> Result<(), ApiError> {
         self.send(Command::JoinPeers(peers)).await?;
         Ok(())
@@ -349,6 +354,12 @@ pub enum Event {
     /// Emitted directly after the matching [`Event::NeighborDown`]; ignore it if you do not need
     /// the reason.
     NeighborDownWithReason(EndpointId, NeighborDownReason),
+    /// A dial attempt toward a peer queued for joining failed.
+    ///
+    /// Emitted to subscribers of every topic that had queued messages toward that peer.
+    /// The peer is also dropped from the passive view, so it will not be retried
+    /// internally; call [`GossipSender::join_peers`] again to retry.
+    JoinFailed(EndpointId),
 }
 
 impl From<crate::proto::Event<EndpointId>> for Event {
