@@ -45,7 +45,7 @@ mod util;
 pub const GOSSIP_ALPN: &[u8] = b"/iroh-gossip/1";
 
 /// Channel capacity for the send queue (one per connection)
-const SEND_QUEUE_CAP: usize = 64;
+const SEND_QUEUE_CAP: usize = 1024;
 /// Channel capacity for the ToActor message queue (single)
 const TO_ACTOR_CAP: usize = 64;
 /// Channel capacity for the InEvent message queue (single)
@@ -352,7 +352,7 @@ impl Actor {
     }
 
     pub async fn run(mut self) {
-        let mut addr_update_stream = self.setup().await;
+        let mut addr_update_stream = self.setup();
 
         let mut i = 0;
         while self.event_loop(&mut addr_update_stream, i).await {
@@ -364,10 +364,10 @@ impl Actor {
     ///
     /// This updates our current address and return it. It also returns the home relay stream and
     /// direct addr stream.
-    async fn setup(&mut self) -> impl Stream<Item = EndpointAddr> + Send + Unpin + use<> {
+    fn setup(&mut self) -> impl Stream<Item = EndpointAddr> + Send + Unpin + use<> {
         let addr_update_stream = self.endpoint.watch_addr().stream();
         let initial_addr = self.endpoint.addr();
-        self.handle_addr_update(initial_addr).await;
+        self.handle_addr_update(initial_addr);
         addr_update_stream
     }
 
@@ -387,7 +387,7 @@ impl Actor {
                     Some(LocalActorMessage::Shutdown { reply }) => {
                         debug!("received shutdown message, quit all topics");
                         self.quit_queue.extend(self.topics.keys().copied());
-                        self.process_quit_queue().await;
+                        self.process_quit_queue();
                         debug!("all topics quit, stop gossip actor");
                         reply.send(()).ok();
                         return false;
@@ -416,12 +416,12 @@ impl Actor {
             },
             Some((key, (topic, command))) = self.command_rx.next(), if !self.command_rx.is_empty() => {
                 trace!(?i, "tick: command_rx");
-                self.handle_command(topic, key, command).await;
+                self.handle_command(topic, key, command);
             },
             Some(new_address) = addr_updates.next() => {
                 trace!(?i, "tick: new_address");
                 self.metrics.actor_tick_endpoint.inc();
-                self.handle_addr_update(new_address).await;
+                self.handle_addr_update(new_address);
             }
             (peer_id, res) = self.dialer.next_conn() => {
                 trace!(?i, "tick: dialer");
@@ -445,8 +445,7 @@ impl Actor {
                                     }
                                 }
                             }
-                            self.handle_in_event(InEvent::PeerDisconnected(peer_id), Instant::now())
-                                .await;
+                            self.handle_in_event(InEvent::PeerDisconnected(peer_id), Instant::now());
                         }
                     }
                     None => {
@@ -459,27 +458,27 @@ impl Actor {
                 trace!(?i, "tick: in_event_rx");
                 self.metrics.actor_tick_in_event_rx.inc();
                 let event = event.expect("unreachable: in_event_tx is never dropped before receiver");
-                self.handle_in_event(event, Instant::now()).await;
+                self.handle_in_event(event, Instant::now());
             }
             _ = self.timers.wait_next() => {
                 trace!(?i, "tick: timers");
                 self.metrics.actor_tick_timers.inc();
                 let now = Instant::now();
                 while let Some((_instant, timer)) = self.timers.pop_before(now) {
-                    self.handle_in_event(InEvent::TimerExpired(timer), now).await;
+                    self.handle_in_event(InEvent::TimerExpired(timer), now);
                 }
             }
             Some(res) = self.connection_tasks.join_next(), if !self.connection_tasks.is_empty() => {
                 trace!(?i, "tick: connection_tasks");
                 let (peer_id, conn, result) = res.expect("connection task panicked");
-                self.handle_connection_task_finished(peer_id, conn, result).await;
+                self.handle_connection_task_finished(peer_id, conn, result);
             }
             Some(res) = self.topic_event_forwarders.join_next(), if !self.topic_event_forwarders.is_empty() => {
                 let topic_id = res.expect("topic event forwarder panicked");
                 if let Some(state) = self.topics.get_mut(&topic_id) {
                     if !state.still_needed() {
                         self.quit_queue.push_back(topic_id);
-                        self.process_quit_queue().await;
+                        self.process_quit_queue();
                     }
                 }
             }
@@ -488,19 +487,13 @@ impl Actor {
         true
     }
 
-    async fn handle_addr_update(&mut self, endpoint_addr: EndpointAddr) {
+    fn handle_addr_update(&mut self, endpoint_addr: EndpointAddr) {
         // let peer_data = our_peer_data(&self.endpoint, current_addresses);
         let peer_data = encode_peer_data(&endpoint_addr.into());
         self.handle_in_event(InEvent::UpdatePeerData(peer_data), Instant::now())
-            .await
     }
 
-    async fn handle_command(
-        &mut self,
-        topic: TopicId,
-        key: stream_group::Key,
-        command: Option<Command>,
-    ) {
+    fn handle_command(&mut self, topic: TopicId, key: stream_group::Key, command: Option<Command>) {
         debug!(?topic, ?key, ?command, "handle command");
         let Some(state) = self.topics.get_mut(&topic) else {
             // TODO: unreachable?
@@ -516,14 +509,13 @@ impl Actor {
                     }
                     Command::JoinPeers(peers) => ProtoCommand::Join(peers),
                 };
-                self.handle_in_event(proto::InEvent::Command(topic, command), Instant::now())
-                    .await;
+                self.handle_in_event(proto::InEvent::Command(topic, command), Instant::now());
             }
             None => {
                 state.command_rx_keys.remove(&key);
                 if !state.still_needed() {
                     self.quit_queue.push_back(topic);
-                    self.process_quit_queue().await;
+                    self.process_quit_queue();
                 }
             }
         }
@@ -534,11 +526,12 @@ impl Actor {
         let conn_id = conn.stable_id();
 
         let queue = match self.peers.entry(peer_id) {
-            Entry::Occupied(mut entry) => entry.get_mut().accept_conn(send_tx, conn_id),
+            Entry::Occupied(mut entry) => entry.get_mut().accept_conn(send_tx, conn.clone()),
             Entry::Vacant(entry) => {
                 entry.insert(PeerState::Active {
                     active_send_tx: send_tx,
                     active_conn_id: conn_id,
+                    active_conn: conn.clone(),
                     other_conns: Vec::new(),
                 });
                 Vec::new()
@@ -568,7 +561,7 @@ impl Actor {
     }
 
     #[tracing::instrument(name = "conn", skip_all, fields(peer = %peer_id.fmt_short()))]
-    async fn handle_connection_task_finished(
+    fn handle_connection_task_finished(
         &mut self,
         peer_id: EndpointId,
         conn: Connection,
@@ -588,8 +581,7 @@ impl Actor {
         {
             if conn.stable_id() == *active_conn_id {
                 debug!("active send connection closed, mark peer as disconnected");
-                self.handle_in_event(InEvent::PeerDisconnected(peer_id), Instant::now())
-                    .await;
+                self.handle_in_event(InEvent::PeerDisconnected(peer_id), Instant::now());
                 // Discard peer descriptor from tracking map upon connection closure to prevent connection descriptor leak
                 self.peers.remove(&peer_id);
             } else {
@@ -650,31 +642,29 @@ impl Actor {
                         ProtoCommand::Join(bootstrap.into_iter().collect()),
                     ),
                     now,
-                )
-                .await;
+                );
             }
         }
     }
 
-    async fn handle_in_event(&mut self, event: InEvent, now: Instant) {
-        self.handle_in_event_inner(event, now).await;
-        self.process_quit_queue().await;
+    fn handle_in_event(&mut self, event: InEvent, now: Instant) {
+        self.handle_in_event_inner(event, now);
+        self.process_quit_queue();
     }
 
-    async fn process_quit_queue(&mut self) {
+    fn process_quit_queue(&mut self) {
         while let Some(topic_id) = self.quit_queue.pop_front() {
             self.handle_in_event_inner(
                 InEvent::Command(topic_id, ProtoCommand::Quit),
                 Instant::now(),
-            )
-            .await;
+            );
             if self.topics.remove(&topic_id).is_some() {
                 tracing::debug!(%topic_id, "publishers and subscribers gone; unsubscribing");
             }
         }
     }
 
-    async fn handle_in_event_inner(&mut self, event: InEvent, now: Instant) {
+    fn handle_in_event_inner(&mut self, event: InEvent, now: Instant) {
         if matches!(event, InEvent::TimerExpired(_)) {
             trace!(?event, "handle in_event");
         } else {
@@ -691,14 +681,29 @@ impl Actor {
                 OutEvent::SendMessage(peer_id, message) => {
                     let state = self.peers.entry(peer_id).or_default();
                     match state {
-                        PeerState::Active { active_send_tx, .. } => {
-                            if let Err(_err) = active_send_tx.send(message).await {
-                                // Removing the peer is handled by the in_event PeerDisconnected sent
-                                // in [`Self::handle_connection_task_finished`].
-                                warn!(
-                                    peer = %peer_id.fmt_short(),
-                                    "failed to send: connection task send loop terminated",
-                                );
+                        PeerState::Active {
+                            active_send_tx,
+                            active_conn,
+                            ..
+                        } => {
+                            // Removing the peer is handled by the in_event PeerDisconnected sent
+                            // in [`Self::handle_connection_task_finished`].
+                            match active_send_tx.try_send(message) {
+                                Ok(()) => {}
+                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    warn!(
+                                        peer = %peer_id.fmt_short(),
+                                        "failed to send: connection task send loop terminated",
+                                    );
+                                }
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    warn!(
+                                        peer = %peer_id.fmt_short(),
+                                        cap = SEND_QUEUE_CAP,
+                                        "peer send queue full; closing connection",
+                                    );
+                                    active_conn.close(1u32.into(), b"send queue full");
+                                }
                             }
                         }
                         PeerState::Pending { queue } => {
@@ -773,6 +778,7 @@ enum PeerState {
     Active {
         active_send_tx: mpsc::Sender<ProtoMessage>,
         active_conn_id: ConnId,
+        active_conn: Connection,
         other_conns: Vec<ConnId>,
     },
 }
@@ -781,14 +787,16 @@ impl PeerState {
     fn accept_conn(
         &mut self,
         send_tx: mpsc::Sender<ProtoMessage>,
-        conn_id: ConnId,
+        conn: Connection,
     ) -> Vec<ProtoMessage> {
+        let conn_id = conn.stable_id();
         match self {
             PeerState::Pending { queue } => {
                 let queue = std::mem::take(queue);
                 *self = PeerState::Active {
                     active_send_tx: send_tx,
                     active_conn_id: conn_id,
+                    active_conn: conn,
                     other_conns: Vec::new(),
                 };
                 queue
@@ -796,6 +804,7 @@ impl PeerState {
             PeerState::Active {
                 active_send_tx,
                 active_conn_id,
+                active_conn,
                 other_conns,
             } => {
                 // We already have an active connection. We keep the old connection intact,
@@ -806,6 +815,7 @@ impl PeerState {
                 other_conns.push(*active_conn_id);
                 *active_send_tx = send_tx;
                 *active_conn_id = conn_id;
+                *active_conn = conn;
                 Vec::new()
             }
         }
@@ -1130,8 +1140,8 @@ pub(crate) mod tests {
 
     impl ManualActorLoop {
         #[instrument(skip_all, fields(me = %actor.endpoint.id().fmt_short()))]
-        async fn new(mut actor: Actor) -> Self {
-            let _ = actor.setup().await;
+        fn new(mut actor: Actor) -> Self {
+            let _ = actor.setup();
             Self { actor, step: 0 }
         }
 
@@ -1422,7 +1432,7 @@ pub(crate) mod tests {
         // create the first endpoint with a manual actor loop
         let (go1, actor, ep1_handle) =
             Gossip::t_new_with_actor(rng, Default::default(), relay_map.clone(), &ct).await?;
-        let mut actor = ManualActorLoop::new(actor).await;
+        let mut actor = ManualActorLoop::new(actor);
 
         // create the second endpoint with the usual actor loop
         let (go2, ep2, ep2_handle, _test_actor_handle) =
@@ -1607,6 +1617,63 @@ pub(crate) mod tests {
         );
         res.expect("send loop returned")
             .std_context("send loop run")?;
+
+        accept_task.abort();
+        Ok(())
+    }
+
+    /// Regression test: a peer that keeps the QUIC connection alive but never reads
+    /// its streams must not block the send loop forever.
+    ///
+    /// Without the write timeout the send loop parks on QUIC flow control, its peer
+    /// queue fills, and the gossip actor blocks on the queue — which freezes every
+    /// topic on the node, not just the link to this peer.
+    #[tokio::test]
+    #[traced_test]
+    async fn send_loop_times_out_when_peer_never_reads() -> Result {
+        let rng = &mut rand::rngs::ChaCha12Rng::seed_from_u64(1);
+        let (relay_map, relay_url, _guard) = iroh::test_utils::run_relay_server().await.unwrap();
+        let ep1 = create_endpoint(rng, relay_map.clone(), None).await?;
+        let ep2 = create_endpoint(rng, relay_map.clone(), None).await?;
+
+        let memory_lookup = MemoryLookup::new();
+        memory_lookup.add_endpoint_info(EndpointAddr::new(ep2.id()).with_relay_url(relay_url));
+        ep1.address_lookup()?.add(memory_lookup);
+
+        let ep2_id = ep2.id();
+        // ep2 holds the connection open but never accepts a stream, so ep1 runs out
+        // of stream credit while the connection stays alive.
+        let accept_task = task::spawn(async move {
+            if let Some(incoming) = ep2.accept().await {
+                if let Ok(conn) = incoming.await {
+                    conn.closed().await;
+                }
+            }
+        });
+
+        let conn = ep1
+            .connect(ep2_id, GOSSIP_ALPN)
+            .await
+            .std_context("connect")?;
+
+        // Keep the sender alive: a closed channel would end the send loop for the
+        // wrong reason.
+        let (_send_tx, send_rx) = mpsc::channel::<ProtoMessage>(1);
+        let queue = (0..200u8)
+            .map(|i| ProtoMessage {
+                topic: TopicId::from_bytes([i; 32]),
+                message: proto::topic::Message::Gossip(proto::plumtree::Message::Prune),
+            })
+            .collect();
+
+        let mut send_loop = util::SendLoop::new(conn, send_rx, 1024);
+        let res = timeout(Duration::from_secs(60), send_loop.run(queue))
+            .await
+            .std_context("send loop did not return")?;
+        assert!(
+            matches!(res, Err(util::WriteError::Timeout { .. })),
+            "send loop must fail with a write timeout, got {res:?}"
+        );
 
         accept_task.abort();
         Ok(())

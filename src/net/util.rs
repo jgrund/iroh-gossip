@@ -53,6 +53,9 @@ pub(crate) enum WriteError {
     /// Message was larger than the configured maximum message size
     #[error("message too large")]
     TooLarge {},
+    /// Writing a message did not make progress within [`SEND_TIMEOUT`]
+    #[error("write timed out after {SEND_TIMEOUT:?}")]
+    Timeout {},
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -195,6 +198,12 @@ impl RecvStreamState {
     }
 }
 
+/// Time a single message write may take before the peer counts as unreachable.
+///
+/// A peer can keep the QUIC connection alive while never reading its streams; the
+/// write then blocks on flow control forever.
+const SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub(crate) struct SendLoop {
     conn: Connection,
     streams: HashMap<TopicId, SendStream>,
@@ -281,6 +290,13 @@ impl SendLoop {
     ///
     /// This function is not cancellation-safe.
     pub async fn write_message(&mut self, message: &ProtoMessage) -> Result<(), WriteError> {
+        match n0_future::time::timeout(SEND_TIMEOUT, self.write_message_inner(message)).await {
+            Ok(res) => res,
+            Err(_elapsed) => Err(e!(WriteError::Timeout)),
+        }
+    }
+
+    async fn write_message_inner(&mut self, message: &ProtoMessage) -> Result<(), WriteError> {
         let ProtoMessage { topic, message } = message;
         let topic_id = *topic;
         let is_last = message.is_disconnect();
