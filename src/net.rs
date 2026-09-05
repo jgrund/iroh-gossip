@@ -573,23 +573,24 @@ impl Actor {
         let reason = conn.close_reason().expect("just closed");
         let error = task_result.err();
         debug!(%reason, ?error, "connection closed");
-        if let Some(PeerState::Active {
-            active_conn_id,
-            other_conns,
-            ..
-        }) = self.peers.get_mut(&peer_id)
-        {
-            if conn.stable_id() == *active_conn_id {
+        match self.peers.get_mut(&peer_id) {
+            Some(PeerState::Active {
+                active_conn_id,
+                other_conns,
+                ..
+            }) if conn.stable_id() != *active_conn_id => {
+                other_conns.retain(|x| *x != conn.stable_id());
+                debug!("remaining {} other connections", other_conns.len() + 1);
+            }
+            Some(PeerState::Active { .. } | PeerState::Closing) => {
                 debug!("active send connection closed, mark peer as disconnected");
                 self.handle_in_event(InEvent::PeerDisconnected(peer_id), Instant::now());
                 // Discard peer descriptor from tracking map upon connection closure to prevent connection descriptor leak
                 self.peers.remove(&peer_id);
-            } else {
-                other_conns.retain(|x| *x != conn.stable_id());
-                debug!("remaining {} other connections", other_conns.len() + 1);
             }
-        } else {
-            debug!("peer already marked as disconnected");
+            Some(PeerState::Pending { .. }) | None => {
+                debug!("peer already marked as disconnected");
+            }
         }
     }
 
@@ -647,6 +648,55 @@ impl Actor {
         }
     }
 
+    fn handle_send_message(
+        peers: &mut HashMap<EndpointId, PeerState>,
+        dialer: &mut Dialer,
+        alpn: &Bytes,
+        peer_id: EndpointId,
+        message: ProtoMessage,
+    ) {
+        let state = peers.entry(peer_id).or_default();
+        match state {
+            PeerState::Active {
+                active_send_tx,
+                active_conn,
+                ..
+            } => {
+                // Removing the peer is handled by the in_event PeerDisconnected sent
+                // in [`Self::handle_connection_task_finished`].
+                match active_send_tx.try_send(message) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        warn!(
+                            peer = %peer_id.fmt_short(),
+                            "failed to send: connection task send loop terminated",
+                        );
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        warn!(
+                            peer = %peer_id.fmt_short(),
+                            cap = SEND_QUEUE_CAP,
+                            "peer send queue full; closing connection",
+                        );
+                        active_conn.close(1u32.into(), b"send queue full");
+                        // Dropping the old state drops the send queue, which ends the send loop.
+                        *state = PeerState::Closing;
+                    }
+                }
+            }
+            PeerState::Closing => {
+                debug!(peer = %peer_id.fmt_short(), "peer is closing; drop message");
+            }
+            PeerState::Pending { queue } => {
+                if queue.is_empty() {
+                    debug!(peer = %peer_id.fmt_short(), "start to dial");
+                    dialer.queue_dial(peer_id, alpn.clone());
+                }
+                queue.push(message);
+            }
+        }
+    }
+
     fn handle_in_event(&mut self, event: InEvent, now: Instant) {
         self.handle_in_event_inner(event, now);
         self.process_quit_queue();
@@ -678,43 +728,13 @@ impl Actor {
                 debug!(?event, "handle out_event");
             };
             match event {
-                OutEvent::SendMessage(peer_id, message) => {
-                    let state = self.peers.entry(peer_id).or_default();
-                    match state {
-                        PeerState::Active {
-                            active_send_tx,
-                            active_conn,
-                            ..
-                        } => {
-                            // Removing the peer is handled by the in_event PeerDisconnected sent
-                            // in [`Self::handle_connection_task_finished`].
-                            match active_send_tx.try_send(message) {
-                                Ok(()) => {}
-                                Err(mpsc::error::TrySendError::Closed(_)) => {
-                                    warn!(
-                                        peer = %peer_id.fmt_short(),
-                                        "failed to send: connection task send loop terminated",
-                                    );
-                                }
-                                Err(mpsc::error::TrySendError::Full(_)) => {
-                                    warn!(
-                                        peer = %peer_id.fmt_short(),
-                                        cap = SEND_QUEUE_CAP,
-                                        "peer send queue full; closing connection",
-                                    );
-                                    active_conn.close(1u32.into(), b"send queue full");
-                                }
-                            }
-                        }
-                        PeerState::Pending { queue } => {
-                            if queue.is_empty() {
-                                debug!(peer = %peer_id.fmt_short(), "start to dial");
-                                self.dialer.queue_dial(peer_id, self.alpn.clone());
-                            }
-                            queue.push(message);
-                        }
-                    }
-                }
+                OutEvent::SendMessage(peer_id, message) => Self::handle_send_message(
+                    &mut self.peers,
+                    &mut self.dialer,
+                    &self.alpn,
+                    peer_id,
+                    message,
+                ),
                 OutEvent::EmitEvent(topic_id, event) => {
                     let Some(state) = self.topics.get_mut(&topic_id) else {
                         // TODO: unreachable?
@@ -781,6 +801,9 @@ enum PeerState {
         active_conn: Connection,
         other_conns: Vec<ConnId>,
     },
+    /// The active connection was closed for a full send queue. The disconnect is
+    /// emitted once its connection task exits.
+    Closing,
 }
 
 impl PeerState {
@@ -800,6 +823,15 @@ impl PeerState {
                     other_conns: Vec::new(),
                 };
                 queue
+            }
+            PeerState::Closing => {
+                *self = PeerState::Active {
+                    active_send_tx: send_tx,
+                    active_conn_id: conn_id,
+                    active_conn: conn,
+                    other_conns: Vec::new(),
+                };
+                Vec::new()
             }
             PeerState::Active {
                 active_send_tx,
@@ -1674,6 +1706,94 @@ pub(crate) mod tests {
             matches!(res, Err(util::WriteError::Timeout { .. })),
             "send loop must fail with a write timeout, got {res:?}"
         );
+
+        accept_task.abort();
+        Ok(())
+    }
+
+    /// Regression test: a peer whose send queue is full is closed exactly once.
+    ///
+    /// The `Full` arm used to leave the peer `Active` until its connection task
+    /// joined, so every further message in the same actor turn warned and closed
+    /// again — a 92-node run logged 22 close lines for two peers within 5ms.
+    #[tokio::test]
+    #[traced_test]
+    async fn full_send_queue_closes_peer_once() -> Result {
+        let rng = &mut rand::rngs::ChaCha12Rng::seed_from_u64(1);
+        let (relay_map, relay_url, _guard) = iroh::test_utils::run_relay_server().await.unwrap();
+        let ep1 = create_endpoint(rng, relay_map.clone(), None).await?;
+        let ep2 = create_endpoint(rng, relay_map, None).await?;
+
+        let memory_lookup = MemoryLookup::new();
+        memory_lookup.add_endpoint_info(EndpointAddr::new(ep2.id()).with_relay_url(relay_url));
+        ep1.address_lookup()?.add(memory_lookup);
+
+        let peer_id = ep2.id();
+        let accept_task = task::spawn(async move {
+            if let Some(incoming) = ep2.accept().await {
+                if let Ok(conn) = incoming.await {
+                    conn.closed().await;
+                }
+            }
+        });
+
+        let conn = ep1
+            .connect(peer_id, GOSSIP_ALPN)
+            .await
+            .std_context("connect")?;
+
+        let (mut actor, _rpc_tx, _local_tx) = Actor::new(
+            ep1,
+            Default::default(),
+            Arc::new(Metrics::default()),
+            None,
+            GossipAddressLookup::default(),
+        );
+
+        let message = || ProtoMessage {
+            topic: TopicId::from_bytes([1u8; 32]),
+            message: proto::topic::Message::Gossip(proto::plumtree::Message::Prune),
+        };
+
+        // The receiver stays alive, so `try_send` on the filled queue reports `Full`.
+        let (send_tx, _send_rx) = mpsc::channel::<ProtoMessage>(1);
+        send_tx.try_send(message()).expect("queue is empty");
+        actor.peers.insert(
+            peer_id,
+            PeerState::Active {
+                active_send_tx: send_tx,
+                active_conn_id: conn.stable_id(),
+                active_conn: conn.clone(),
+                other_conns: Vec::new(),
+            },
+        );
+
+        for _ in 0..3 {
+            Actor::handle_send_message(
+                &mut actor.peers,
+                &mut actor.dialer,
+                &actor.alpn,
+                peer_id,
+                message(),
+            );
+        }
+        assert!(matches!(
+            actor.peers.get(&peer_id),
+            Some(PeerState::Closing)
+        ));
+        logs_assert(|lines: &[&str]| {
+            match lines
+                .iter()
+                .filter(|line| line.contains("peer send queue full"))
+                .count()
+            {
+                1 => Ok(()),
+                n => Err(format!("expected one close, got {n}")),
+            }
+        });
+
+        actor.handle_connection_task_finished(peer_id, conn, Ok(()));
+        assert!(!actor.peers.contains_key(&peer_id));
 
         accept_task.abort();
         Ok(())
