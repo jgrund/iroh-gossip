@@ -6,6 +6,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
+    time::Duration,
 };
 
 use bytes::Bytes;
@@ -44,8 +45,10 @@ mod util;
 /// ALPN protocol name
 pub const GOSSIP_ALPN: &[u8] = b"/iroh-gossip/1";
 
-/// Channel capacity for the send queue (one per connection)
-const SEND_QUEUE_CAP: usize = 1024;
+/// Default channel capacity for the send queue (one per connection)
+const DEFAULT_SEND_QUEUE_CAP: usize = 1024;
+/// Default time a single message write may take before the peer counts as unreachable
+const DEFAULT_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 /// Channel capacity for the ToActor message queue (single)
 const TO_ACTOR_CAP: usize = 64;
 /// Channel capacity for the InEvent message queue (single)
@@ -146,6 +149,8 @@ impl ProtocolHandler for Gossip {
 pub struct Builder {
     config: proto::Config,
     alpn: Option<Bytes>,
+    send_timeout: Duration,
+    send_queue_cap: usize,
 }
 
 impl Builder {
@@ -153,6 +158,24 @@ impl Builder {
     /// By default this is `4096` bytes.
     pub fn max_message_size(mut self, size: usize) -> Self {
         self.config.max_message_size = size;
+        self
+    }
+
+    /// Sets how long a single message write may take before the peer counts as unreachable.
+    ///
+    /// A peer can keep the connection alive while never reading its streams; the write
+    /// then blocks on flow control forever. The same bound evicts a peer whose send queue
+    /// stays full for this long. By default this is 10 seconds.
+    pub fn send_timeout(mut self, timeout: Duration) -> Self {
+        self.send_timeout = timeout;
+        self
+    }
+
+    /// Sets how many messages the send queue of a single peer holds.
+    ///
+    /// Messages for a peer whose queue is full are dropped. By default this is `1024`.
+    pub fn send_queue_cap(mut self, cap: usize) -> Self {
+        self.send_queue_cap = cap;
         self
     }
 
@@ -199,6 +222,8 @@ impl Builder {
             metrics.clone(),
             self.alpn,
             address_lookup,
+            self.send_timeout,
+            self.send_queue_cap,
         );
         let me = actor.endpoint.id().fmt_short();
         let max_message_size = actor.state.max_message_size();
@@ -226,6 +251,8 @@ impl Gossip {
         Builder {
             config: Default::default(),
             alpn: None,
+            send_timeout: DEFAULT_SEND_TIMEOUT,
+            send_queue_cap: DEFAULT_SEND_QUEUE_CAP,
         }
     }
 
@@ -273,7 +300,6 @@ impl Gossip {
 
 /// Actor that sends and handles messages between the connection and main state loops
 struct Actor {
-    alpn: Bytes,
     /// Protocol state
     state: proto::State<PublicKey, StdRng>,
     /// The endpoint through which we dial peers
@@ -302,6 +328,10 @@ struct Actor {
     metrics: Arc<Metrics>,
     topic_event_forwarders: JoinSet<TopicId>,
     address_lookup: GossipAddressLookup,
+    /// Time a write may take, and a send queue may stay full, before a peer is dropped.
+    send_timeout: Duration,
+    /// Capacity of the send queue of a single peer.
+    send_queue_cap: usize,
 }
 
 impl Actor {
@@ -311,13 +341,16 @@ impl Actor {
         metrics: Arc<Metrics>,
         alpn: Option<Bytes>,
         address_lookup: GossipAddressLookup,
+        send_timeout: Duration,
+        send_queue_cap: usize,
     ) -> (
         Self,
         mpsc::Sender<RpcMessage>,
         mpsc::Sender<LocalActorMessage>,
     ) {
         let peer_id = endpoint.id();
-        let dialer = Dialer::new(endpoint.clone());
+        let alpn = alpn.unwrap_or_else(|| GOSSIP_ALPN.to_vec().into());
+        let dialer = Dialer::new(endpoint.clone(), alpn);
         let state = proto::State::new(
             peer_id,
             Default::default(),
@@ -329,7 +362,6 @@ impl Actor {
         let (in_event_tx, in_event_rx) = mpsc::channel(IN_EVENT_CAP);
 
         let actor = Actor {
-            alpn: alpn.unwrap_or_else(|| GOSSIP_ALPN.to_vec().into()),
             endpoint,
             state,
             dialer,
@@ -346,6 +378,8 @@ impl Actor {
             local_rx,
             topic_event_forwarders: Default::default(),
             address_lookup,
+            send_timeout,
+            send_queue_cap,
         };
 
         (actor, rpc_tx, local_tx)
@@ -511,7 +545,7 @@ impl Actor {
     }
 
     fn handle_connection(&mut self, peer_id: EndpointId, origin: ConnOrigin, conn: Connection) {
-        let (send_tx, send_rx) = mpsc::channel(SEND_QUEUE_CAP);
+        let (send_tx, send_rx) = mpsc::channel(self.send_queue_cap);
         let conn_id = conn.stable_id();
 
         let queue = match self.peers.entry(peer_id) {
@@ -522,27 +556,25 @@ impl Actor {
                     active_conn_id: conn_id,
                     active_conn: conn.clone(),
                     other_conns: Vec::new(),
+                    full_since: None,
                 });
                 Vec::new()
             }
         };
 
         let max_message_size = self.state.max_message_size();
-        let in_event_tx = self.in_event_tx.clone();
+        let send_loop = SendLoop::new(conn.clone(), send_rx, max_message_size, self.send_timeout);
+        let recv_loop = RecvLoop::new(
+            peer_id,
+            conn.clone(),
+            self.in_event_tx.clone(),
+            max_message_size,
+        );
 
         // Spawn a task for this connection
         self.connection_tasks.spawn(
             async move {
-                let res = connection_loop(
-                    peer_id,
-                    conn.clone(),
-                    origin,
-                    send_rx,
-                    in_event_tx,
-                    max_message_size,
-                    queue,
-                )
-                .await;
+                let res = connection_loop(origin, send_loop, recv_loop, queue).await;
                 (peer_id, conn, res)
             }
             .instrument(error_span!("conn", peer = %peer_id.fmt_short())),
@@ -664,21 +696,24 @@ impl Actor {
     fn handle_send_message(
         peers: &mut HashMap<EndpointId, PeerState>,
         dialer: &mut Dialer,
-        alpn: &Bytes,
         peer_id: EndpointId,
         message: ProtoMessage,
+        now: Instant,
+        send_timeout: Duration,
+        metrics: &Metrics,
     ) {
         let state = peers.entry(peer_id).or_default();
         match state {
             PeerState::Active {
                 active_send_tx,
                 active_conn,
+                full_since,
                 ..
             } => {
                 // Removing the peer is handled by the in_event PeerDisconnected sent
                 // in [`Self::handle_connection_task_finished`].
                 match active_send_tx.try_send(message) {
-                    Ok(()) => {}
+                    Ok(()) => *full_since = None,
                     Err(mpsc::error::TrySendError::Closed(_)) => {
                         warn!(
                             peer = %peer_id.fmt_short(),
@@ -686,14 +721,30 @@ impl Actor {
                         );
                     }
                     Err(mpsc::error::TrySendError::Full(_)) => {
-                        warn!(
-                            peer = %peer_id.fmt_short(),
-                            cap = SEND_QUEUE_CAP,
-                            "peer send queue full; closing connection",
-                        );
-                        active_conn.close(1u32.into(), b"send queue full");
-                        // Dropping the old state drops the send queue, which ends the send loop.
-                        *state = PeerState::Closing;
+                        metrics.send_queue_full_dropped.inc();
+                        match full_since {
+                            None => {
+                                warn!(
+                                    peer = %peer_id.fmt_short(),
+                                    "peer send queue full; dropping messages",
+                                );
+                                *full_since = Some(now);
+                            }
+                            // A queue that stays full for the write timeout is as
+                            // unreachable as a write that makes no progress for it.
+                            Some(since) if now.duration_since(*since) >= send_timeout => {
+                                warn!(
+                                    peer = %peer_id.fmt_short(),
+                                    "peer send queue full for {send_timeout:?}; closing connection",
+                                );
+                                active_conn.close(1u32.into(), b"send queue full");
+                                // Dropping the old state drops the send queue, which ends the send loop.
+                                *state = PeerState::Closing;
+                            }
+                            Some(_) => {
+                                debug!(peer = %peer_id.fmt_short(), "send queue still full; dropping message");
+                            }
+                        }
                     }
                 }
             }
@@ -703,7 +754,7 @@ impl Actor {
             PeerState::Pending { queue } => {
                 if queue.is_empty() {
                     debug!(peer = %peer_id.fmt_short(), "start to dial");
-                    dialer.queue_dial(peer_id, alpn.clone());
+                    dialer.queue_dial(peer_id);
                 }
                 queue.push(message);
             }
@@ -744,9 +795,11 @@ impl Actor {
                 OutEvent::SendMessage(peer_id, message) => Self::handle_send_message(
                     &mut self.peers,
                     &mut self.dialer,
-                    &self.alpn,
                     peer_id,
                     message,
+                    now,
+                    self.send_timeout,
+                    &self.metrics,
                 ),
                 OutEvent::EmitEvent(topic_id, event) => {
                     let Some(state) = self.topics.get_mut(&topic_id) else {
@@ -813,9 +866,11 @@ enum PeerState {
         active_conn_id: ConnId,
         active_conn: Connection,
         other_conns: Vec<ConnId>,
+        /// When the send queue last went from accepting to full.
+        full_since: Option<Instant>,
     },
-    /// The active connection was closed for a full send queue. The disconnect is
-    /// emitted once its connection task exits.
+    /// The active connection was closed for a send queue that stayed full. The
+    /// disconnect is emitted once its connection task exits.
     Closing,
 }
 
@@ -834,6 +889,7 @@ impl PeerState {
                     active_conn_id: conn_id,
                     active_conn: conn,
                     other_conns: Vec::new(),
+                    full_since: None,
                 };
                 queue
             }
@@ -843,6 +899,7 @@ impl PeerState {
                     active_conn_id: conn_id,
                     active_conn: conn,
                     other_conns: Vec::new(),
+                    full_since: None,
                 };
                 Vec::new()
             }
@@ -851,6 +908,7 @@ impl PeerState {
                 active_conn_id,
                 active_conn,
                 other_conns,
+                full_since,
             } => {
                 // We already have an active connection. We keep the old connection intact,
                 // but only use the new connection for sending from now on.
@@ -861,6 +919,7 @@ impl PeerState {
                 *active_send_tx = send_tx;
                 *active_conn_id = conn_id;
                 *active_conn = conn;
+                *full_since = None;
                 Vec::new()
             }
         }
@@ -942,18 +1001,12 @@ impl<T> From<mpsc::error::SendError<T>> for ConnectionLoopError {
 }
 
 async fn connection_loop(
-    from: PublicKey,
-    conn: Connection,
     origin: ConnOrigin,
-    send_rx: mpsc::Receiver<ProtoMessage>,
-    in_event_tx: mpsc::Sender<InEvent>,
-    max_message_size: usize,
+    mut send_loop: SendLoop,
+    mut recv_loop: RecvLoop,
     queue: Vec<ProtoMessage>,
 ) -> Result<(), ConnectionLoopError> {
     debug!(?origin, "connection established");
-
-    let mut send_loop = SendLoop::new(conn.clone(), send_rx, max_message_size);
-    let mut recv_loop = RecvLoop::new(from, conn, in_event_tx, max_message_size);
 
     // The peer may still use this connection, so `recv_loop` decides when it
     // is done.
@@ -1065,6 +1118,7 @@ impl Stream for TopicCommandStream {
 #[derive(Debug)]
 struct Dialer {
     endpoint: Endpoint,
+    alpn: Bytes,
     pending: JoinSet<(
         EndpointId,
         Option<Result<Connection, iroh::endpoint::ConnectError>>,
@@ -1074,22 +1128,24 @@ struct Dialer {
 
 impl Dialer {
     /// Create a new dialer for a [`Endpoint`]
-    fn new(endpoint: Endpoint) -> Self {
+    fn new(endpoint: Endpoint, alpn: Bytes) -> Self {
         Self {
             endpoint,
+            alpn,
             pending: Default::default(),
             pending_dials: Default::default(),
         }
     }
 
     /// Starts to dial a endpoint by [`EndpointId`].
-    fn queue_dial(&mut self, endpoint_id: EndpointId, alpn: Bytes) {
+    fn queue_dial(&mut self, endpoint_id: EndpointId) {
         if self.is_pending(endpoint_id) {
             return;
         }
         let cancel = CancellationToken::new();
         self.pending_dials.insert(endpoint_id, cancel.clone());
         let endpoint = self.endpoint.clone();
+        let alpn = self.alpn.clone();
         self.pending.spawn(
             async move {
                 let res = tokio::select! {
@@ -1149,7 +1205,7 @@ pub(crate) mod tests {
     use futures_concurrency::future::TryJoin;
     use iroh::{
         address_lookup::memory::MemoryLookup,
-        endpoint::{presets, BindError},
+        endpoint::{presets, BindError, QuicTransportConfig},
         protocol::Router,
         tls::CaTlsConfig,
         RelayMap, RelayMode, SecretKey,
@@ -1234,8 +1290,15 @@ pub(crate) mod tests {
                 .expect("endpoint is not closed")
                 .add(address_lookup.clone());
 
-            let (actor, to_actor_tx, conn_tx) =
-                Actor::new(endpoint, config, metrics.clone(), None, address_lookup);
+            let (actor, to_actor_tx, conn_tx) = Actor::new(
+                endpoint,
+                config,
+                metrics.clone(),
+                None,
+                address_lookup,
+                DEFAULT_SEND_TIMEOUT,
+                DEFAULT_SEND_QUEUE_CAP,
+            );
             let max_message_size = actor.state.max_message_size();
 
             let _actor_handle = AbortOnDropHandle::new(task::spawn(n0_future::future::pending()));
@@ -1619,6 +1682,8 @@ pub(crate) mod tests {
             metrics,
             None,
             Default::default(),
+            DEFAULT_SEND_TIMEOUT,
+            DEFAULT_SEND_QUEUE_CAP,
         );
         Ok(actor)
     }
@@ -1657,6 +1722,7 @@ pub(crate) mod tests {
                 active_conn_id: active_conn.stable_id(),
                 active_conn,
                 other_conns: Vec::new(),
+                full_since: None,
             },
         );
 
@@ -1714,7 +1780,7 @@ pub(crate) mod tests {
         let (send_tx, send_rx) = mpsc::channel(1);
         drop(send_tx);
 
-        let mut send_loop = SendLoop::new(conn, send_rx, 1024);
+        let mut send_loop = SendLoop::new(conn, send_rx, 1024, DEFAULT_SEND_TIMEOUT);
         timeout(Duration::from_secs(5), send_loop.run(vec![]))
             .await
             .std_context("send loop did not stop")?
@@ -1948,7 +2014,7 @@ pub(crate) mod tests {
             })
             .collect();
 
-        let mut send_loop = util::SendLoop::new(conn, send_rx, 1024);
+        let mut send_loop = util::SendLoop::new(conn, send_rx, 1024, Duration::from_secs(2));
         let res = timeout(Duration::from_secs(60), send_loop.run(queue))
             .await
             .std_context("send loop did not return")?;
@@ -1961,16 +2027,255 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// Regression test: a peer whose send queue is full is closed exactly once.
+    /// A peer whose send queue is full only for a burst keeps its connection.
+    #[tokio::test]
+    #[traced_test]
+    async fn transient_full_does_not_evict() -> Result {
+        let rng = &mut rand::rngs::ChaCha12Rng::seed_from_u64(1);
+        let (relay_map, relay_url, _guard) = iroh::test_utils::run_relay_server().await.unwrap();
+        let (peer_id, conn, mut actor, accept_task) =
+            t_stalled_peer(rng, relay_map, relay_url).await?;
+
+        // The receiver stays alive, so `try_send` on the filled queue reports `Full`.
+        let (send_tx, mut send_rx) = mpsc::channel::<ProtoMessage>(1);
+        send_tx.try_send(t_message()).expect("queue is empty");
+        actor.peers.insert(
+            peer_id,
+            PeerState::Active {
+                active_send_tx: send_tx,
+                active_conn_id: conn.stable_id(),
+                active_conn: conn,
+                other_conns: Vec::new(),
+                full_since: None,
+            },
+        );
+
+        let now = Instant::now();
+        actor.t_send(peer_id, now);
+        send_rx.try_recv().expect("the peer drains its queue");
+        actor.t_send(peer_id, now + Duration::from_millis(1));
+
+        assert!(matches!(
+            actor.peers.get(&peer_id),
+            Some(PeerState::Active {
+                full_since: None,
+                ..
+            })
+        ));
+        logs_assert(|lines: &[&str]| match t_count_full_warnings(lines) {
+            1 => Ok(()),
+            n => Err(format!("expected one congestion warning, got {n}")),
+        });
+
+        accept_task.abort();
+        Ok(())
+    }
+
+    /// Regression test: a peer whose send queue stays full for the send timeout is
+    /// closed exactly once.
     ///
     /// The `Full` arm used to leave the peer `Active` until its connection task
     /// joined, so every further message in the same actor turn warned and closed
     /// again — a 92-node run logged 22 close lines for two peers within 5ms.
     #[tokio::test]
     #[traced_test]
-    async fn full_send_queue_closes_peer_once() -> Result {
+    async fn sustained_full_evicts() -> Result {
         let rng = &mut rand::rngs::ChaCha12Rng::seed_from_u64(1);
         let (relay_map, relay_url, _guard) = iroh::test_utils::run_relay_server().await.unwrap();
+        let (peer_id, conn, mut actor, accept_task) =
+            t_stalled_peer(rng, relay_map, relay_url).await?;
+
+        let (send_tx, _send_rx) = mpsc::channel::<ProtoMessage>(1);
+        send_tx.try_send(t_message()).expect("queue is empty");
+        actor.peers.insert(
+            peer_id,
+            PeerState::Active {
+                active_send_tx: send_tx,
+                active_conn_id: conn.stable_id(),
+                active_conn: conn.clone(),
+                other_conns: Vec::new(),
+                full_since: None,
+            },
+        );
+
+        let now = Instant::now();
+        actor.t_send(peer_id, now);
+        actor.t_send(peer_id, now + DEFAULT_SEND_TIMEOUT / 2);
+        assert!(matches!(
+            actor.peers.get(&peer_id),
+            Some(PeerState::Active { .. })
+        ));
+
+        actor.t_send(
+            peer_id,
+            now + DEFAULT_SEND_TIMEOUT + Duration::from_millis(1),
+        );
+        assert!(matches!(
+            actor.peers.get(&peer_id),
+            Some(PeerState::Closing)
+        ));
+        assert!(conn.close_reason().is_some());
+        logs_assert(|lines: &[&str]| match t_count_full_warnings(lines) {
+            2 => Ok(()),
+            n => Err(format!("expected congestion start and eviction, got {n}")),
+        });
+
+        actor.handle_connection_task_finished(peer_id, conn, Ok(()));
+        assert!(!actor.peers.contains_key(&peer_id));
+
+        accept_task.abort();
+        Ok(())
+    }
+
+    /// Regression test: a neighbor that never accepts a stream from us must not
+    /// wedge the actor — its own queue overflows while other topics keep flowing.
+    ///
+    /// The actor used to await the per-peer send queue, so one such neighbor froze
+    /// every topic on the node.
+    #[tokio::test]
+    #[traced_test]
+    async fn stalled_neighbor_does_not_wedge_actor() -> Result {
+        let rng = &mut rand::rngs::ChaCha12Rng::seed_from_u64(1);
+        let (relay_map, relay_url, _guard) = iroh::test_utils::run_relay_server().await.unwrap();
+        let memory_lookup = MemoryLookup::new();
+
+        let ep1 = create_endpoint(rng, relay_map.clone(), Some(memory_lookup.clone())).await?;
+        let ep2 = create_endpoint(rng, relay_map.clone(), Some(memory_lookup.clone())).await?;
+        let stalled_ep = Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Custom(relay_map))
+            .secret_key(SecretKey::from_bytes(&rng.random()))
+            .alpns(vec![GOSSIP_ALPN.to_vec()])
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            // Grant no uni stream: this neighbor never takes what we send it.
+            .transport_config(
+                QuicTransportConfig::builder()
+                    .max_concurrent_uni_streams(0_u32.into())
+                    .build(),
+            )
+            .bind()
+            .await?;
+        stalled_ep.address_lookup()?.add(memory_lookup.clone());
+        stalled_ep.online().await;
+
+        memory_lookup
+            .add_endpoint_info(EndpointAddr::new(ep1.id()).with_relay_url(relay_url.clone()));
+        memory_lookup.add_endpoint_info(EndpointAddr::new(ep2.id()).with_relay_url(relay_url));
+
+        let go1 = Gossip::builder().send_queue_cap(8).spawn(ep1.clone());
+        let go2 = Gossip::builder().spawn(ep2.clone());
+        let go_stalled = Gossip::builder().spawn(stalled_ep.clone());
+
+        let cancel = CancellationToken::new();
+        let tasks = [
+            spawn(endpoint_loop(ep1.clone(), go1.clone(), cancel.clone())),
+            spawn(endpoint_loop(ep2.clone(), go2.clone(), cancel.clone())),
+        ];
+
+        let stalled_topic: TopicId = blake3::hash(b"stalled").into();
+        let healthy_topic: TopicId = blake3::hash(b"healthy").into();
+
+        let mut sub1_stalled = go1.subscribe(stalled_topic, vec![]).await?;
+        let (sink1_healthy, _stream1_healthy) = go1.subscribe(healthy_topic, vec![]).await?.split();
+        let _sub_stalled = go_stalled.subscribe(stalled_topic, vec![ep1.id()]).await?;
+
+        let stalled_id = stalled_ep.id();
+        timeout(Duration::from_secs(30), async {
+            while let Some(event) = sub1_stalled.next().await {
+                if matches!(event?, Event::NeighborUp(peer) if peer == stalled_id) {
+                    break;
+                }
+            }
+            Ok::<(), AnyError>(())
+        })
+        .await
+        .std_context("stalled neighbor never joined")??;
+
+        let mut sub2 = timeout(
+            Duration::from_secs(30),
+            go2.subscribe_and_join(healthy_topic, vec![ep1.id()]),
+        )
+        .await
+        .std_context("healthy peer never joined")??;
+
+        let (sink1_stalled, _stream1_stalled) = sub1_stalled.split();
+        timeout(Duration::from_secs(30), async {
+            for i in 0..64_u16 {
+                sink1_stalled
+                    .broadcast(i.to_be_bytes().to_vec().into())
+                    .await?;
+            }
+            Ok::<(), AnyError>(())
+        })
+        .await
+        .std_context("broadcast on the stalled topic blocked")??;
+
+        timeout(Duration::from_secs(30), async {
+            while go1.metrics().send_queue_full_dropped.get() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .std_context("the stalled peer's send queue never overflowed")?;
+
+        sink1_healthy
+            .broadcast(Bytes::from_static(b"alive"))
+            .await?;
+        let received = timeout(Duration::from_secs(30), async {
+            loop {
+                if let Event::Received(msg) = sub2.next().await.expect("stream open")? {
+                    return Ok::<Bytes, AnyError>(msg.content);
+                }
+            }
+        })
+        .await
+        .std_context("healthy peer never received the broadcast")??;
+        assert_eq!(received, Bytes::from_static(b"alive"));
+
+        cancel.cancel();
+        for t in tasks {
+            timeout(Duration::from_secs(10), t)
+                .await
+                .std_context("endpoint loop did not stop")?
+                .std_context("endpoint loop panicked")??;
+        }
+        Ok(())
+    }
+
+    fn t_message() -> ProtoMessage {
+        ProtoMessage {
+            topic: TopicId::from_bytes([1u8; 32]),
+            message: proto::topic::Message::Gossip(proto::plumtree::Message::Prune),
+        }
+    }
+
+    fn t_count_full_warnings(lines: &[&str]) -> usize {
+        lines
+            .iter()
+            .filter(|line| line.contains("peer send queue full"))
+            .count()
+    }
+
+    impl Actor {
+        fn t_send(&mut self, peer_id: EndpointId, now: Instant) {
+            Self::handle_send_message(
+                &mut self.peers,
+                &mut self.dialer,
+                peer_id,
+                t_message(),
+                now,
+                self.send_timeout,
+                &self.metrics,
+            );
+        }
+    }
+
+    /// Connects to a peer that holds the connection open, and returns an actor that
+    /// has not yet heard of it.
+    async fn t_stalled_peer(
+        rng: &mut rand::rngs::ChaCha12Rng,
+        relay_map: RelayMap,
+        relay_url: RelayUrl,
+    ) -> Result<(EndpointId, Connection, Actor, tokio::task::JoinHandle<()>)> {
         let ep1 = create_endpoint(rng, relay_map.clone(), None).await?;
         let ep2 = create_endpoint(rng, relay_map, None).await?;
 
@@ -1992,61 +2297,17 @@ pub(crate) mod tests {
             .await
             .std_context("connect")?;
 
-        let (mut actor, _rpc_tx, _local_tx) = Actor::new(
+        let (actor, _rpc_tx, _local_tx) = Actor::new(
             ep1,
             Default::default(),
             Arc::new(Metrics::default()),
             None,
             GossipAddressLookup::default(),
+            DEFAULT_SEND_TIMEOUT,
+            DEFAULT_SEND_QUEUE_CAP,
         );
 
-        let message = || ProtoMessage {
-            topic: TopicId::from_bytes([1u8; 32]),
-            message: proto::topic::Message::Gossip(proto::plumtree::Message::Prune),
-        };
-
-        // The receiver stays alive, so `try_send` on the filled queue reports `Full`.
-        let (send_tx, _send_rx) = mpsc::channel::<ProtoMessage>(1);
-        send_tx.try_send(message()).expect("queue is empty");
-        actor.peers.insert(
-            peer_id,
-            PeerState::Active {
-                active_send_tx: send_tx,
-                active_conn_id: conn.stable_id(),
-                active_conn: conn.clone(),
-                other_conns: Vec::new(),
-            },
-        );
-
-        for _ in 0..3 {
-            Actor::handle_send_message(
-                &mut actor.peers,
-                &mut actor.dialer,
-                &actor.alpn,
-                peer_id,
-                message(),
-            );
-        }
-        assert!(matches!(
-            actor.peers.get(&peer_id),
-            Some(PeerState::Closing)
-        ));
-        logs_assert(|lines: &[&str]| {
-            match lines
-                .iter()
-                .filter(|line| line.contains("peer send queue full"))
-                .count()
-            {
-                1 => Ok(()),
-                n => Err(format!("expected one close, got {n}")),
-            }
-        });
-
-        actor.handle_connection_task_finished(peer_id, conn, Ok(()));
-        assert!(!actor.peers.contains_key(&peer_id));
-
-        accept_task.abort();
-        Ok(())
+        Ok((peer_id, conn, actor, accept_task))
     }
 
     /// Test that endpoints can reconnect to each other.
