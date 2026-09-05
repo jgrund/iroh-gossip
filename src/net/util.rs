@@ -53,9 +53,9 @@ pub(crate) enum WriteError {
     /// Message was larger than the configured maximum message size
     #[error("message too large")]
     TooLarge {},
-    /// Writing a message did not make progress within [`SEND_TIMEOUT`]
-    #[error("write timed out after {SEND_TIMEOUT:?}")]
-    Timeout {},
+    /// Writing a message did not make progress within the configured send timeout
+    #[error("write timed out after {timeout:?}")]
+    Timeout { timeout: Duration },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -198,12 +198,6 @@ impl RecvStreamState {
     }
 }
 
-/// Time a single message write may take before the peer counts as unreachable.
-///
-/// A peer can keep the QUIC connection alive while never reading its streams; the
-/// write then blocks on flow control forever.
-const SEND_TIMEOUT: Duration = Duration::from_secs(10);
-
 pub(crate) struct SendLoop {
     conn: Connection,
     streams: HashMap<TopicId, SendStream>,
@@ -211,6 +205,7 @@ pub(crate) struct SendLoop {
     max_message_size: usize,
     finishing: JoinSet<()>,
     send_rx: mpsc::Receiver<ProtoMessage>,
+    send_timeout: Duration,
 }
 
 impl SendLoop {
@@ -218,6 +213,7 @@ impl SendLoop {
         conn: Connection,
         send_rx: mpsc::Receiver<ProtoMessage>,
         max_message_size: usize,
+        send_timeout: Duration,
     ) -> Self {
         Self {
             conn,
@@ -226,6 +222,7 @@ impl SendLoop {
             streams: Default::default(),
             finishing: Default::default(),
             send_rx,
+            send_timeout,
         }
     }
 
@@ -290,9 +287,11 @@ impl SendLoop {
     ///
     /// This function is not cancellation-safe.
     pub async fn write_message(&mut self, message: &ProtoMessage) -> Result<(), WriteError> {
-        match n0_future::time::timeout(SEND_TIMEOUT, self.write_message_inner(message)).await {
+        match n0_future::time::timeout(self.send_timeout, self.write_message_inner(message)).await {
             Ok(res) => res,
-            Err(_elapsed) => Err(e!(WriteError::Timeout)),
+            Err(_elapsed) => Err(e!(WriteError::Timeout {
+                timeout: self.send_timeout
+            })),
         }
     }
 
