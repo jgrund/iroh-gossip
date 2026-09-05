@@ -51,7 +51,7 @@ use bytes::Bytes;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 mod hyparview;
-mod plumtree;
+pub(crate) mod plumtree;
 pub mod state;
 pub mod topic;
 pub mod util;
