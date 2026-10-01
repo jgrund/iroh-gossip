@@ -574,7 +574,7 @@ impl Actor {
         // Spawn a task for this connection
         self.connection_tasks.spawn(
             async move {
-                let res = connection_loop(origin, send_loop, recv_loop, queue).await;
+                let res = connection_loop(origin, conn.clone(), send_loop, recv_loop, queue).await;
                 (peer_id, conn, res)
             }
             .instrument(error_span!("conn", peer = %peer_id.fmt_short())),
@@ -1002,6 +1002,7 @@ impl<T> From<mpsc::error::SendError<T>> for ConnectionLoopError {
 
 async fn connection_loop(
     origin: ConnOrigin,
+    conn: Connection,
     mut send_loop: SendLoop,
     mut recv_loop: RecvLoop,
     queue: Vec<ProtoMessage>,
@@ -1013,6 +1014,10 @@ async fn connection_loop(
     let (send_done_tx, send_done_rx) = oneshot::channel();
     let send_fut = async {
         let res = send_loop.run(queue).await;
+        // A stream the peer keeps open would hold `recv_loop`, and the dead peer, forever.
+        if res.is_err() {
+            conn.close(2u32.into(), b"send failed");
+        }
         send_done_tx.send(()).ok();
         res
     }
@@ -1785,6 +1790,58 @@ pub(crate) mod tests {
             .await
             .std_context("send loop did not stop")?
             .std_context("send loop")?;
+        Ok(())
+    }
+
+    /// A failed send loop ends the connection loop while the peer keeps a stream open.
+    ///
+    /// Otherwise the peer stays `Active` with a dead send loop and is never redialed.
+    #[tokio::test]
+    #[traced_test]
+    async fn send_error_with_open_peer_stream_ends_connection_loop() -> Result {
+        let rng = &mut rand::rngs::ChaCha12Rng::seed_from_u64(1);
+        let (relay_map, relay_url, _guard) = iroh::test_utils::run_relay_server().await.unwrap();
+        let ep1 = create_endpoint(rng, relay_map.clone(), None).await?;
+        let ep2 = create_endpoint(rng, relay_map, None).await?;
+        let ep2_id = ep2.id();
+        let ep2_addr = EndpointAddr::new(ep2_id).with_relay_url(relay_url);
+        let topic: TopicId = blake3::hash(b"send_error").into();
+
+        // The peer opens a topic stream and keeps it open, as a live neighbor does.
+        let _accept = AbortOnDropHandle::new(spawn(async move {
+            let incoming = ep2.accept().await.expect("endpoint closed");
+            let conn = incoming.await.expect("accept failed");
+            let mut stream = conn.open_uni().await.expect("open_uni");
+            util::StreamHeader { topic_id: topic }
+                .write(&mut stream, &mut Vec::new(), 1024)
+                .await
+                .expect("write header");
+            conn.closed().await;
+            drop(stream);
+        }));
+
+        let conn = ep1
+            .connect(ep2_addr, GOSSIP_ALPN)
+            .await
+            .std_context("connect")?;
+        // The actor still holds the sender: the peer state is `Active`.
+        let (_send_tx, send_rx) = mpsc::channel(1);
+        let (in_event_tx, _in_event_rx) = mpsc::channel(16);
+        // A frame limit of one byte makes every write fail.
+        let send_loop = SendLoop::new(conn.clone(), send_rx, 1, DEFAULT_SEND_TIMEOUT);
+        let recv_loop = RecvLoop::new(ep2_id, conn.clone(), in_event_tx, 1024);
+        let message = ProtoMessage {
+            topic,
+            message: proto::topic::Message::Gossip(proto::plumtree::Message::Prune),
+        };
+
+        let res = timeout(
+            util::IDLE_GRACE + Duration::from_secs(3),
+            connection_loop(ConnOrigin::Dial, conn, send_loop, recv_loop, vec![message]),
+        )
+        .await
+        .std_context("connection loop still runs after the send loop failed")?;
+        assert!(res.is_err(), "the write did not fail");
         Ok(())
     }
 
