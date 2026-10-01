@@ -625,7 +625,10 @@ impl Actor {
                 other_conns.retain(|x| *x != conn.stable_id());
                 debug!("remaining {} other connections", other_conns.len() + 1);
             }
-            Some(PeerState::Active { .. } | PeerState::Closing) => {
+            Some(PeerState::Closing { conn_id }) if conn.stable_id() != *conn_id => {
+                debug!("superseded connection closed while the peer is closing");
+            }
+            Some(PeerState::Active { .. } | PeerState::Closing { .. }) => {
                 debug!("active send connection closed, mark peer as disconnected");
                 // The protocol emits `DisconnectPeer` only for peers it received a
                 // message from. For all others this is the only place that drops
@@ -706,6 +709,7 @@ impl Actor {
         match state {
             PeerState::Active {
                 active_send_tx,
+                active_conn_id,
                 active_conn,
                 full_since,
                 ..
@@ -739,7 +743,9 @@ impl Actor {
                                 );
                                 active_conn.close(1u32.into(), b"send queue full");
                                 // Dropping the old state drops the send queue, which ends the send loop.
-                                *state = PeerState::Closing;
+                                *state = PeerState::Closing {
+                                    conn_id: *active_conn_id,
+                                };
                             }
                             Some(_) => {
                                 debug!(peer = %peer_id.fmt_short(), "send queue still full; dropping message");
@@ -748,7 +754,7 @@ impl Actor {
                     }
                 }
             }
-            PeerState::Closing => {
+            PeerState::Closing { .. } => {
                 debug!(peer = %peer_id.fmt_short(), "peer is closing; drop message");
             }
             PeerState::Pending { queue } => {
@@ -871,7 +877,9 @@ enum PeerState {
     },
     /// The active connection was closed for a send queue that stayed full. The
     /// disconnect is emitted once its connection task exits.
-    Closing,
+    Closing {
+        conn_id: ConnId,
+    },
 }
 
 impl PeerState {
@@ -893,7 +901,7 @@ impl PeerState {
                 };
                 queue
             }
-            PeerState::Closing => {
+            PeerState::Closing { .. } => {
                 *self = PeerState::Active {
                     active_send_tx: send_tx,
                     active_conn_id: conn_id,
@@ -2169,7 +2177,7 @@ pub(crate) mod tests {
         );
         assert!(matches!(
             actor.peers.get(&peer_id),
-            Some(PeerState::Closing)
+            Some(PeerState::Closing { .. })
         ));
         assert!(conn.close_reason().is_some());
         logs_assert(|lines: &[&str]| match t_count_full_warnings(lines) {
@@ -2180,6 +2188,32 @@ pub(crate) mod tests {
         actor.handle_connection_task_finished(peer_id, conn, Ok(()));
         assert!(!actor.peers.contains_key(&peer_id));
 
+        accept_task.abort();
+        Ok(())
+    }
+
+    /// A superseded connection that ends while the peer is closing does not disconnect it.
+    #[tokio::test]
+    #[traced_test]
+    async fn superseded_conn_end_keeps_closing_peer() -> Result {
+        let rng = &mut rand::rngs::ChaCha12Rng::seed_from_u64(1);
+        let (relay_map, relay_url, _guard) = iroh::test_utils::run_relay_server().await.unwrap();
+        let (peer_id, conn, mut actor, accept_task) =
+            t_stalled_peer(rng, relay_map, relay_url).await?;
+        let closing_conn_id = conn.stable_id() + 1;
+        actor.peers.insert(
+            peer_id,
+            PeerState::Closing {
+                conn_id: closing_conn_id,
+            },
+        );
+
+        actor.handle_connection_task_finished(peer_id, conn, Ok(()));
+
+        assert!(matches!(
+            actor.peers.get(&peer_id),
+            Some(PeerState::Closing { conn_id }) if *conn_id == closing_conn_id
+        ));
         accept_task.abort();
         Ok(())
     }
